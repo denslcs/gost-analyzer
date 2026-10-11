@@ -158,7 +158,6 @@ def get_task(
 @router.get('/{task_id}/download')
 def download_result(
     task_id: str,
-    user_id: str | None = Query(default=None, description='Устаревший параметр, игнорируется'),
     format: str = Query(default='pdf', alias='format', description='Формат: pdf или docx'),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -175,7 +174,6 @@ def download_result(
 @router.get('/{task_id}/report')
 def download_report(
     task_id: str,
-    user_id: str | None = Query(default=None, description='Устаревший параметр, игнорируется'),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -191,7 +189,6 @@ def download_report(
 @router.delete('/{task_id}', response_model=TaskDeleteResponse)
 def delete_task(
     task_id: str,
-    user_id: str | None = Query(default=None, description='Устаревший параметр, игнорируется'),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
