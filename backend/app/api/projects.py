@@ -7,6 +7,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
+from app.core.deps import get_current_user
+from app.models.user import User
 from app.core.config import settings
 from app.core.errors import require_docx_upload, require_image_upload, raise_api_error
 from app.models.project import Project, ProjectStatus
@@ -50,13 +52,14 @@ def upload_project_file(
     user_id: str | None = Form(default=None),
     topic: str | None = Form(default=None, description="Тема работы для ML"),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     if not file.filename:
         raise_api_error("invalid_file_format", "Имя файла отсутствует.")
     require_docx_upload(file.filename)
 
     project = Project(
-        user_id=user_id,
+        user_id=str(current_user.id),
         status=ProjectStatus.UPLOADED,
         source_filename=Path(file.filename).name,
         source_path="",
@@ -96,10 +99,16 @@ def upload_project_file(
 
 
 @router.get("/{project_id}", response_model=ProjectStatusResponse)
-def get_project_status(project_id: str, db: Session = Depends(get_db)):
+def get_project_status(
+    project_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     project = db.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Проект не найден.")
+
+    _ensure_project_owner(project, str(current_user.id), "просматривать статус")
 
     return ProjectStatusResponse(
         project_id=project.id,
@@ -115,13 +124,14 @@ def get_project_status(project_id: str, db: Session = Depends(get_db)):
 def upload_project_additional_file(
     project_id: str,
     file: UploadFile = File(...),
-    user_id: str = Form(...),
+    user_id: str | None = Form(default=None),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     project = db.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Проект не найден.")
-    _ensure_project_owner(project, user_id, "загружать файлы")
+    _ensure_project_owner(project, str(current_user.id), "загружать файлы")
     if not file.filename:
         raise_api_error("invalid_file_format", "Имя файла отсутствует.")
     require_image_upload(file.filename)
@@ -156,7 +166,7 @@ def upload_project_additional_file(
 @router.post("/{project_id}/process", response_model=ProjectProcessResponse)
 def process_project_document(
     project_id: str,
-    user_id: str = Form(...),
+    user_id: str | None = Form(default=None),
     faculty: str = Form(...),
     department: str = Form(...),
     student_group: str = Form(...),
@@ -167,6 +177,7 @@ def process_project_document(
     discipline: str = Form(...),
     topic: str | None = Form(default=None, description="Тема для ML (если не задана при upload)"),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
     Связка doc-service: extract → apply_ml_changes → download PDF + DOCX.
@@ -174,7 +185,7 @@ def process_project_document(
     project = db.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Проект не найден.")
-    _ensure_project_owner(project, user_id, "запускать обработку")
+    _ensure_project_owner(project, str(current_user.id), "запускать обработку")
 
     docx_path = resolve_primary_project_docx(project)
     if not docx_path:
@@ -197,7 +208,7 @@ def process_project_document(
     }
 
     task = DocumentTask(
-        user_id=user_id,
+        user_id=str(current_user.id),
         project_id=project_id,
         original_filename=docx_path.name,
         input_path="",
@@ -254,13 +265,14 @@ def process_project_document(
 @router.get("/{project_id}/suggestions", response_model=ProjectSuggestionsResponse)
 def get_image_suggestions(
     project_id: str,
-    user_id: str = Query(..., description="Идентификатор пользователя"),
+    user_id: str | None = Query(default=None, description="Устаревший параметр; не используется для авторизации"),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     project = db.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Проект не найден.")
-    _ensure_project_owner(project, user_id, "смотреть подсказки")
+    _ensure_project_owner(project, str(current_user.id), "смотреть подсказки")
 
     meta = pm.load(project)
     suggestions = build_image_suggestions_from_metadata(project.id, meta)
@@ -278,13 +290,14 @@ def get_image_suggestions(
 def apply_image_suggestions(
     project_id: str,
     body: ApplySuggestionsBody,
-    user_id: str = Query(..., description="Идентификатор пользователя"),
+    user_id: str | None = Query(default=None, description="Устаревший параметр; не используется для авторизации"),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     project = db.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Проект не найден.")
-    _ensure_project_owner(project, user_id, "применять подсказки")
+    _ensure_project_owner(project, str(current_user.id), "применять подсказки")
 
     meta = pm.load(project)
     suggestions = meta.get("image_suggestions") or []
@@ -303,18 +316,19 @@ def apply_image_suggestions(
 @router.get("/{project_id}/download")
 def download_project_result(
     project_id: str,
-    user_id: str = Query(..., description="Идентификатор пользователя"),
+    user_id: str | None = Query(default=None, description="Устаревший параметр; не используется для авторизации"),
     format: str = Query(
         default='pdf',
         alias='format',
         description='Формат: pdf или docx',
     ),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     project = db.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Проект не найден.")
-    _ensure_project_owner(project, user_id, "скачать результат")
+    _ensure_project_owner(project, str(current_user.id), "скачать результат")
 
     fmt = format.lower().strip()
     path, media_type, filename = resolve_project_output(db, project_id, fmt)
@@ -324,13 +338,14 @@ def download_project_result(
 @router.delete("/{project_id}", response_model=ProjectDeleteResponse)
 def delete_project(
     project_id: str,
-    user_id: str = Query(..., description="Идентификатор пользователя"),
+    user_id: str | None = Query(default=None, description="Устаревший параметр; не используется для авторизации"),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     project = db.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Проект не найден.")
-    _ensure_project_owner(project, user_id, "удалить проект")
+    _ensure_project_owner(project, str(current_user.id), "удалить проект")
 
     related_tasks = db.execute(select(DocumentTask).where(DocumentTask.project_id == project_id)).scalars().all()
     for task in related_tasks:
@@ -353,13 +368,14 @@ def delete_project(
 @router.post("/{project_id}/analyze", response_model=ProjectAnalysisResponse)
 def analyze_project(
     project_id: str,
-    user_id: str = Query(..., description="Идентификатор пользователя"),
+    user_id: str | None = Query(default=None, description="Устаревший параметр; не используется для авторизации"),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     project = db.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Проект не найден.")
-    _ensure_project_owner(project, user_id, "запускать анализ")
+    _ensure_project_owner(project, str(current_user.id), "запускать анализ")
 
     try:
         docx_path = resolve_primary_project_docx(project)
@@ -398,13 +414,14 @@ def analyze_project(
 @router.get("/{project_id}/analysis", response_model=ProjectAnalysisResponse)
 def get_project_analysis(
     project_id: str,
-    user_id: str = Query(..., description="Идентификатор пользователя"),
+    user_id: str | None = Query(default=None, description="Устаревший параметр; не используется для авторизации"),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     project = db.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Проект не найден.")
-    _ensure_project_owner(project, user_id, "смотреть анализ")
+    _ensure_project_owner(project, str(current_user.id), "смотреть анализ")
 
     meta = pm.load(project)
     analysis = meta.get("analysis")
