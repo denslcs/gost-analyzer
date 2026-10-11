@@ -2,12 +2,13 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
-from sqlalchemy.orm import Session
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from app.core.db import get_db
-from app.core.config import settings
-from app.core.errors import require_docx_upload, raise_api_error
+from app.core.deps import get_current_user
+from app.models.user import User
+from app.core.errors import require_docx_upload
 from app.models.task import DocumentTask, TaskStatus
 from app.models.project import Project, ProjectStatus
 from app.schemas.task import (
@@ -18,7 +19,7 @@ from app.schemas.task import (
     TaskDeleteResponse,
 )
 from app.services.download_files import resolve_task_output, task_output_flags
-from app.services.storage import save_input_file, get_report_path
+from app.services.storage import save_input_file
 from app.services.task_pipeline import run_document_task_pipeline
 from app.services import orchestrator
 
@@ -32,6 +33,16 @@ def _get_project_or_404(db: Session, project_id: str) -> Project:
     return project
 
 
+def _ensure_project_owner(project: Project, current_user: User) -> None:
+    if not project.user_id or str(project.user_id) != str(current_user.id):
+        raise HTTPException(status_code=403, detail='Проект принадлежит другому пользователю или не имеет владельца.')
+
+
+def _ensure_task_owner(task: DocumentTask, current_user: User) -> None:
+    if not task.user_id or str(task.user_id) != str(current_user.id):
+        raise HTTPException(status_code=403, detail='Нет доступа к задаче другого пользователя или задаче без владельца.')
+
+
 def _update_project_status(db: Session, project: Project | None, status: ProjectStatus) -> None:
     if project is None:
         return
@@ -42,7 +53,6 @@ def _update_project_status(db: Session, project: Project | None, status: Project
 @router.post('', response_model=TaskCreateResponse)
 def create_task(
     file: UploadFile = File(...),
-    user_id: str | None = Form(default=None),
     project_id: str | None = Form(default=None),
     faculty: str = Form(...),
     department: str = Form(...),
@@ -51,19 +61,15 @@ def create_task(
     lab_number: str = Form(...),
     student_name: str = Form(...),
     reviewer_name: str = Form(...),
-    discipline: str =  Form(...),
+    discipline: str = Form(...),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     require_docx_upload(file.filename)
-
     project: Project | None = None
     if project_id:
         project = _get_project_or_404(db, project_id)
-        if not user_id:
-            raise HTTPException(status_code=400, detail='Для привязки задачи к проекту требуется user_id.')
-        if project.user_id and project.user_id != user_id:
-            raise HTTPException(status_code=403, detail='Проект принадлежит другому пользователю.')
-
+        _ensure_project_owner(project, current_user)
     payload = {
         'faculty': faculty,
         'department': department,
@@ -74,9 +80,8 @@ def create_task(
         'reviewer_name': reviewer_name,
         'discipline': discipline,
     }
-
     task = DocumentTask(
-        user_id=user_id,
+        user_id=str(current_user.id),
         project_id=project_id,
         original_filename=file.filename,
         input_path='',
@@ -88,26 +93,26 @@ def create_task(
     db.add(task)
     db.commit()
     db.refresh(task)
-
     input_path = save_input_file(task.id, file)
     _update_project_status(db, project, ProjectStatus.PROCESSING)
-
     result = run_document_task_pipeline(db, task, project, input_path)
-    if result["type"] == "validation_failed":
-        return TaskCreateResponse(task_id=task.id, status=task.status.value, report=result["report"])
-    return TaskCreateResponse(task_id=task.id, status=task.status.value, report=result["report"])
+    if result['type'] == 'validation_failed':
+        return TaskCreateResponse(task_id=task.id, status=task.status.value, report=result['report'])
+    return TaskCreateResponse(task_id=task.id, status=task.status.value, report=result['report'])
 
 
 @router.get('', response_model=TaskHistoryResponse)
 def list_tasks(
     limit: int = Query(default=20, ge=1, le=100),
-    user_id: str | None = Query(default=None),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    stmt = select(DocumentTask)
-    if user_id:
-        stmt = stmt.where(DocumentTask.user_id == user_id)
-    stmt = stmt.order_by(DocumentTask.created_at.desc()).limit(limit)
+    stmt = (
+        select(DocumentTask)
+        .where(DocumentTask.user_id == str(current_user.id))
+        .order_by(DocumentTask.created_at.desc())
+        .limit(limit)
+    )
     tasks = db.execute(stmt).scalars().all()
     items = [
         TaskHistoryItem(
@@ -126,11 +131,15 @@ def list_tasks(
 
 
 @router.get('/{task_id}', response_model=TaskStatusResponse)
-def get_task(task_id: str, db: Session = Depends(get_db)):
+def get_task(
+    task_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     task = db.get(DocumentTask, task_id)
     if not task:
         raise HTTPException(status_code=404, detail='Задача не найдена.')
-
+    _ensure_task_owner(task, current_user)
     flags = task_output_flags(task)
     return TaskStatusResponse(
         task_id=task.id,
@@ -149,21 +158,15 @@ def get_task(task_id: str, db: Session = Depends(get_db)):
 @router.get('/{task_id}/download')
 def download_result(
     task_id: str,
-    user_id: str = Query(..., description='Идентификатор пользователя'),
-    format: str = Query(
-        default='pdf',
-        alias='format',
-        description='Формат: pdf или docx',
-    ),
+    user_id: str | None = Query(default=None, description='Устаревший параметр, игнорируется'),
+    format: str = Query(default='pdf', alias='format', description='Формат: pdf или docx'),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     task = db.get(DocumentTask, task_id)
     if not task:
         raise HTTPException(status_code=404, detail='Задача не найдена.')
-    if not task.user_id:
-        raise HTTPException(status_code=403, detail='У задачи не задан владелец. Скачивание запрещено.')
-    if task.user_id != user_id:
-        raise HTTPException(status_code=403, detail='Нельзя скачать файл другой пользователя.')
+    _ensure_task_owner(task, current_user)
     fmt = format.lower().strip()
     path, media_type, filename = resolve_task_output(task, fmt)
     return FileResponse(str(path), media_type=media_type, filename=filename)
@@ -172,33 +175,30 @@ def download_result(
 @router.get('/{task_id}/report')
 def download_report(
     task_id: str,
-    user_id: str = Query(..., description='Идентификатор пользователя'),
+    user_id: str | None = Query(default=None, description='Устаревший параметр, игнорируется'),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     task = db.get(DocumentTask, task_id)
-    if not task or not task.report_path:
+    if not task:
+        raise HTTPException(status_code=404, detail='Задача не найдена.')
+    _ensure_task_owner(task, current_user)
+    if not task.report_path:
         raise HTTPException(status_code=404, detail='Отчёт не найден.')
-    if not task.user_id:
-        raise HTTPException(status_code=403, detail='У задачи не задан владелец. Скачивание отчёта запрещено.')
-    if task.user_id != user_id:
-        raise HTTPException(status_code=403, detail='Нельзя скачать отчёт другой пользователя.')
     return FileResponse(task.report_path, media_type='application/json', filename=f'{task_id}.json')
 
 
 @router.delete('/{task_id}', response_model=TaskDeleteResponse)
 def delete_task(
     task_id: str,
-    user_id: str = Query(..., description='Идентификатор пользователя'),
+    user_id: str | None = Query(default=None, description='Устаревший параметр, игнорируется'),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     task = db.get(DocumentTask, task_id)
     if not task:
         raise HTTPException(status_code=404, detail='Задача не найдена.')
-    if not task.user_id:
-        raise HTTPException(status_code=403, detail='У задачи не задан владелец. Удаление запрещено.')
-    if task.user_id != user_id:
-        raise HTTPException(status_code=403, detail='Нельзя удалить задачу другого пользователя.')
-
+    _ensure_task_owner(task, current_user)
     paths_to_delete = [task.input_path, task.report_path, task.output_path]
     output_paths = (task.payload or {}).get('output_paths') or {}
     paths_to_delete.extend(output_paths.values())
@@ -207,7 +207,6 @@ def delete_task(
             path = Path(file_path)
             if path.is_file():
                 path.unlink()
-
     db.delete(task)
     db.commit()
     return TaskDeleteResponse(task_id=task_id, status='deleted')
@@ -216,13 +215,12 @@ def delete_task(
 @router.post('/extract', response_model=dict)
 def extract_docx(
     file: UploadFile = File(...),
-    user_id: str | None = Form(default=None),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     require_docx_upload(file.filename)
-
     task = DocumentTask(
-        user_id=user_id,
+        user_id=str(current_user.id),
         original_filename=file.filename,
         input_path='',
         payload={},
@@ -233,14 +231,12 @@ def extract_docx(
     db.add(task)
     db.commit()
     db.refresh(task)
-
     input_path = save_input_file(task.id, file)
     if Path(input_path).stat().st_size == 0:
         task.status = TaskStatus.FAILED
         task.errors = ['Входной файл пустой.']
         db.commit()
         raise HTTPException(status_code=400, detail='Входной файл пустой.')
-
     try:
         raw = orchestrator.extract_via_doc_service(Path(input_path), task.id)
         content = orchestrator.normalize_extract_for_frontend(raw)
