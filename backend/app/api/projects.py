@@ -7,6 +7,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
+from app.core.deps import get_current_user
+from app.models.user import User
 from app.core.config import settings
 from app.core.errors import require_docx_upload, require_image_upload, raise_api_error
 from app.models.project import Project, ProjectStatus
