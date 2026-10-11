@@ -7,8 +7,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
-from app.core.deps import get_current_user
-from app.models.user import User
 from app.core.config import settings
 from app.core.errors import require_docx_upload, require_image_upload, raise_api_error
 from app.models.project import Project, ProjectStatus
@@ -49,16 +47,16 @@ def _ensure_project_owner(project: Project, user_id: str, action: str) -> None:
 @router.post("/upload", response_model=ProjectUploadResponse)
 def upload_project_file(
     file: UploadFile = File(...),
+    user_id: str | None = Form(default=None),
     topic: str | None = Form(default=None, description="Тема работы для ML"),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     if not file.filename:
         raise_api_error("invalid_file_format", "Имя файла отсутствует.")
     require_docx_upload(file.filename)
 
     project = Project(
-        user_id=current_user.id,
+        user_id=user_id,
         status=ProjectStatus.UPLOADED,
         source_filename=Path(file.filename).name,
         source_path="",
