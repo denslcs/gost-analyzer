@@ -53,7 +53,7 @@ def _update_project_status(db: Session, project: Project | None, status: Project
 @router.post('', response_model=TaskCreateResponse)
 def create_task(
     file: UploadFile = File(...),
-    project_id: str | None = Form(default=None),
+    project_id: str = Form(...),
     faculty: str = Form(...),
     department: str = Form(...),
     student_group: str = Form(...),
@@ -66,10 +66,8 @@ def create_task(
     current_user: User = Depends(get_current_user),
 ):
     require_docx_upload(file.filename)
-    project: Project | None = None
-    if project_id:
-        project = _get_project_or_404(db, project_id)
-        _ensure_project_owner(project, current_user)
+    project = _get_project_or_404(db, project_id)
+    _ensure_project_owner(project, current_user)
     payload = {
         'faculty': faculty,
         'department': department,
